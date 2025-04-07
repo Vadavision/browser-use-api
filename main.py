@@ -67,7 +67,9 @@ class TaskRequest(BaseModel):
 	task: str
 	task_id: Optional[str] = None  # Optional task ID, will be generated if not provided
 	headless: bool = True  # Run browser in headless mode by default
-	redis_url: Optional[str] = None  # Optional Redis URL for state persistence
+	redis_url: Optional[str] = None  # Optional Redis URL for state persistence (legacy format)
+	redis_host: Optional[str] = None  # Optional Redis host (new format)
+	redis_port: Optional[int] = None  # Optional Redis port (new format)
 	model: str = 'gpt-4o-mini'  # LLM model to use
 
 
@@ -437,8 +439,18 @@ class MultiAgentManager:
 		return None
 
 
+# Get Redis configuration from environment variables
+REDIS_HOST = os.environ.get('REDIS_HOST')
+REDIS_PORT = os.environ.get('REDIS_PORT', '6379')
+
+# Construct Redis URL if host is provided
+redis_url = None
+if REDIS_HOST:
+    redis_url = f"redis://{REDIS_HOST}:{REDIS_PORT}"
+    logger.info(f"Initializing Redis connection to {REDIS_HOST}:{REDIS_PORT}")
+
 # Create a singleton instance of the multi-agent manager
-agent_manager = MultiAgentManager()
+agent_manager = MultiAgentManager(redis_url)
 
 
 @app.post('/api/browser-use/tasks/start')
@@ -449,10 +461,18 @@ async def run_and_stream(request: TaskRequest):
 		# Create a new task with the provided task_id or generate one
 		task_id = request.task_id or str(uuid.uuid4())
 		
-		# Initialize Redis if URL is provided
-		if request.redis_url and REDIS_AVAILABLE and not agent_manager.use_redis:
-			# Create a new manager with Redis
-			agent_manager = MultiAgentManager(request.redis_url)
+		# Handle Redis connection based on provided parameters
+		if REDIS_AVAILABLE and not agent_manager.use_redis:
+			# Priority 1: Use redis_url if provided directly in the request
+			if request.redis_url:
+				agent_manager = MultiAgentManager(request.redis_url)
+				logger.info(f"Using Redis URL from request: {request.redis_url}")
+			# Priority 2: Construct URL from redis_host and redis_port if provided in the request
+			elif request.redis_host:
+				port = request.redis_port or 6379
+				constructed_url = f"redis://{request.redis_host}:{port}"
+				agent_manager = MultiAgentManager(constructed_url)
+				logger.info(f"Using Redis connection from request parameters: {request.redis_host}:{port}")
 		
 		# Create the task
 		task_id = await agent_manager.create_task(
