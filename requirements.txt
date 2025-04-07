@@ -1,0 +1,24 @@
+# Core dependencies
+browser-use>=0.1.40
+fastapi>=0.110.0
+uvicorn>=0.27.0
+pydantic>=2.0.0
+
+# For OpenAI integration
+langchain-openai>=0.0.5
+
+# For Server-Sent Events
+sse-starlette>=2.2.0
+
+# For CORS and static file serving
+python-multipart>=0.0.6
+
+# For async operations
+asyncio>=3.4.3
+
+# For API documentation
+fastapi-utils>=0.2.1
+
+# For Redis integration (optional)
+redis>=5.0.0
+aioredis>=2.0.0  # For async Redis operations
