@@ -11,6 +11,7 @@ The Browser Use API is a FastAPI-based service that provides browser automation 
 - **Multi-agent management**: Supports multiple simultaneous browser tasks
 - **Real-time updates**: Uses Server-Sent Events (SSE) to stream progress updates
 - **Redis integration**: Leverages Redis for state management and task coordination
+- **S3 screenshot storage**: Optionally stores screenshots in S3 and returns URLs instead of base64 data
 - **Health check endpoint**: Supports Kubernetes health probes
 - **Containerized**: Packaged as a Docker container for easy deployment
 
@@ -54,6 +55,28 @@ The Browser Use API is deployed alongside the main NestJS backend using Kubernet
 - `GET /api/browser-use/health`: Health check endpoint for Kubernetes
 - `GET /health`: Simple health check endpoint
 - `GET /browser/debug-url`: Get browser's remote debugging URL for a specific task
+
+## S3 Screenshot Storage
+
+The API can optionally store screenshots in Amazon S3 instead of including them directly in the response payload. This significantly reduces the size of the streamed data and improves performance.
+
+### Configuration
+
+To enable S3 screenshot storage, set the following environment variables:
+
+```
+AWS_ACCESS_KEY_ID=your_aws_access_key_here
+AWS_SECRET_ACCESS_KEY=your_aws_secret_key_here
+AWS_REGION=us-east-1
+S3_BUCKET_NAME=your-screenshot-bucket
+S3_PREFIX=screenshots  # Folder prefix within the bucket
+```
+
+### How It Works
+
+1. When S3 is properly configured, screenshots are uploaded to the specified S3 bucket
+2. The API returns a `screenshot_url` field instead of the `screenshot` field in the state updates
+3. If S3 upload fails or is not configured, the API falls back to including the raw screenshot data
 
 ## Integration
 

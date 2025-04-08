@@ -22,3 +22,9 @@ fastapi-utils>=0.2.1
 # For Redis integration (optional)
 redis>=5.0.0
 aioredis>=2.0.0  # For async Redis operations
+
+# For browser automation
+playwright>=1.40.0
+
+# For S3 integration
+boto3>=1.34.0
