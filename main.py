@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime
 from queue import Queue
 from threading import Lock
 from typing import Dict, List, Optional, Union, Any
@@ -16,9 +15,13 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+# Import S3 uploader
+from s3_utils import s3_uploader
+
 from browser_use import Agent
-from custom_system_prompt import HumanHelpSystemPrompt
 from custom_controller import HumanHelpController
+from browser_use.browser.context import BrowserContext, BrowserContextConfig
+
 
 # Optional Redis imports - will be used if available
 try:
@@ -34,59 +37,6 @@ logger = logging.getLogger('browser-use-api')
 # Create a queue for log messages
 log_queue = Queue()
 log_lock = Lock()
-
-
-def state_requires_input(state_data: Dict[str, Any]) -> bool:
-    """
-    Determines if a state update indicates that user input is required
-    
-    Args:
-        state_data: The state data to check
-        
-    Returns:
-        True if user input is required, False otherwise
-    """
-    # Check actions for ask_human type
-    actions = state_data.get('action', [])
-    if isinstance(actions, list):
-        for action in actions:
-            if isinstance(action, dict) and action.get('type') == 'ask_human':
-                return True
-                
-    return False
-
-
-def extract_input_requirements(state_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extracts input requirements from a state update
-    
-    Args:
-        state_data: The state data to extract input requirements from
-        
-    Returns:
-        A dictionary describing the input requirements
-    """
-    # Default requirements
-    requirements = {
-        'input_type': 'text',
-        'prompt': 'Please provide the required input',
-        'options': []
-    }
-    
-    # Extract from ask_human action
-    actions = state_data.get('action', [])
-    if isinstance(actions, list):
-        for action in actions:
-            if isinstance(action, dict) and action.get('type') == 'ask_human':
-                if action.get('message'):
-                    requirements['prompt'] = action['message']
-                if action.get('input_type'):
-                    requirements['input_type'] = action['input_type']
-                if action.get('options') and isinstance(action['options'], list):
-                    requirements['options'] = action['options']
-                break
-    
-    return requirements
 
 
 class LogHandler(logging.Handler):
@@ -129,6 +79,13 @@ class TaskRequest(BaseModel):
 	model: str = 'gpt-4o-mini'  # LLM model to use
 
 
+class ResumeTaskRequest(BaseModel):
+	"""Request model for resuming a paused task with user input"""
+	input_text: Optional[str] = None  # Free-form text input from user
+	selected_option: Optional[str] = None  # Selected option from a set of choices
+	other_data: Optional[Dict[str, Any]] = None  # Any other data required
+
+
 class AgentTask:
 	"""Represents a single agent task with its associated resources"""
 	def __init__(self, task_id: str, task_description: str, model: str = 'gpt-4o-mini', headless: bool = True):
@@ -138,18 +95,14 @@ class AgentTask:
 		self._running = False
 		self.browser_debug_url: Optional[str] = None
 		self.remote_debugging_port = self._get_available_port()  # Dynamic port allocation
-		self.state_queue = asyncio.Queue()  # Queue for state updates (without screenshots)
-		self.screenshot_queue = asyncio.Queue()  # Separate queue for screenshot updates
+		self.state_queue = asyncio.Queue()  # Queue for state updates
+		self.screenshot_queue = asyncio.Queue()  # Queue for screenshots
 		self.task_completed = False
 		self.model = model
 		self.headless = headless
 		self.creation_time = asyncio.get_event_loop().time()
 		self.last_activity_time = self.creation_time
-		
-	@property
-	def is_running(self):
-		"""Check if the task is currently running"""
-		return self._running
+		self._paused_for_input = False  # Flag to track if task is paused for human input
 		
 	@staticmethod
 	def _get_available_port(start_port=9222, max_attempts=100):
@@ -161,8 +114,8 @@ class AgentTask:
 					return port
 		return start_port  # Fallback to default if no ports available
 	
-	async def initialize(self):
-		"""Initialize the agent with browser"""
+	async def initialize(self, controller=None):
+		"""Initialize the agent with browser and optional controller"""
 		llm = ChatOpenAI(model=self.model)
 		
 		# Create a Browser instance with remote debugging enabled
@@ -178,23 +131,23 @@ class AgentTask:
 			headless=self.headless,
 			extra_chromium_args=extra_args
 		)
+
+		config = BrowserContextConfig(
+			highlight_elements=False,
+		)
 		
 		browser = Browser(config=browser_config)
+		context = BrowserContext(browser=browser, config=config)
 		
-		# Create custom controller with ask_human action
-		custom_controller = HumanHelpController()
 		
-		# Create agent with the configured browser, custom system prompt, and custom controller
+		# Create agent with the configured browser and controller if provided
 		self.agent = Agent(
 			task=self.task_description, 
 			llm=llm, 
 			browser=browser,
-			system_prompt_class=HumanHelpSystemPrompt,  # Use our custom system prompt
-			controller=custom_controller  # Use our custom controller
+			browser_context=context,
+			controller=controller
 		)
-		
-		# Store a reference to the task in the browser for the ask_human action
-		browser.task = self
 		self._running = False
 		
 		# Set the debug URL (will be available after the browser is launched)
@@ -225,60 +178,87 @@ class AgentTask:
 			"current_state": agent_output.current_state.model_dump() if agent_output and hasattr(agent_output, 'current_state') else None
 		}
 		
-		# Handle screenshots separately
-		if browser_state.screenshot:
-			# Create a screenshot data object
+		# Check if this is a requires_input state (ask_human action)
+		requires_input = False
+		# agent_output.action is a list of ActionModel objects and each ActionModel has action_name
+		
+		# Optional debug logging for action structure (uncomment if needed)
+		# if agent_output and hasattr(agent_output, 'action') and agent_output.action:
+		# 	logger.info(f"DEBUG - Agent actions found: {len(agent_output.action)}")
+		# 	for action in agent_output.action:
+		# 		if hasattr(action, 'model_dump'):
+		# 			logger.info(f"DEBUG - Action model_dump: {action.model_dump()}")
+		
+		if agent_output and hasattr(agent_output, 'action') and agent_output.action:
+			# Process all actions to get their active type
+			filtered_actions = self._filter_active_actions([a.model_dump() for a in agent_output.action])
+			
+			# Look for ask_human actions in the filtered actions
+			ask_human_actions = [a for a in filtered_actions if "ask_human" in a] if filtered_actions else []
+			
+			if ask_human_actions:
+				# Get the first ask_human action
+				ask_human_action = ask_human_actions[0]
+				ask_human_params = ask_human_action.get('ask_human', {})
+				
+				# Pause the agent before setting anything in state data
+				self.agent.pause()
+				
+				# Set flag for requiring input
+				requires_input = True
+				state_data["requires_input"] = True
+				
+				# Extract input requirements directly from the action parameters
+				state_data["input_requirements"] = {
+					"input_type": ask_human_params.get("input_type", "text"),
+					"prompt": ask_human_params.get("message", "Please provide input"),
+					"options": ask_human_params.get("options", [])
+				}
+		
+		# Save the screenshot (base64 encoded) for separate screenshot stream
+		if hasattr(browser_state, 'screenshot') and browser_state.screenshot:
+			# Upload screenshot to S3 if configured
+			screenshot_url = None
+			try:
+				screenshot_url = await s3_uploader.upload_screenshot(
+					base64_screenshot=browser_state.screenshot,
+					task_id=self.task_id,
+					step_number=step_number
+				)
+				if screenshot_url:
+					logger.info(f"Uploaded screenshot to S3: {screenshot_url}")
+			except Exception as e:
+				logger.error(f"Error uploading screenshot to S3: {e}")
+				# Continue with local screenshot if S3 upload fails
+			
+			# Store screenshot with step info for the screenshot stream
 			screenshot_data = {
 				"task_id": self.task_id,
 				"step_number": step_number,
 				"timestamp": asyncio.get_event_loop().time()
 			}
 			
-			# Handle screenshot upload to S3 if available
-			try:
-				# Import the S3 uploader
-				from s3_utils import s3_uploader
-				
-				# Try to upload to S3 and get URL - this won't block the state stream
-				screenshot_url = await s3_uploader.upload_screenshot(
-					base64_screenshot=browser_state.screenshot,
-					task_id=self.task_id,
-					step_number=step_number
-				)
-				
-				if screenshot_url:
-					# If S3 upload succeeded, include the URL
-					screenshot_data["screenshot_url"] = screenshot_url
-					logger.debug(f"Using S3 URL for screenshot in step {step_number}")
-				else:
-					# If S3 upload failed or not configured, include raw data
-					screenshot_data["screenshot"] = browser_state.screenshot
-					logger.debug(f"Using raw screenshot data in step {step_number}")
-			except ImportError:
-				# S3 utils not available, fall back to including raw screenshot
+			# Add screenshot URL if available, otherwise include base64 data
+			if screenshot_url:
+				screenshot_data["screenshot_url"] = screenshot_url
+			else:
 				screenshot_data["screenshot"] = browser_state.screenshot
-				logger.debug("S3 uploader not available, using raw screenshot data")
-			except Exception as e:
-				logger.error(f"Error handling screenshot: {e}")
-				# Still include raw screenshot as fallback
-				screenshot_data["screenshot"] = browser_state.screenshot
-			
-			# Put the screenshot data in the separate queue
-			try:
-				import json
-				await self.screenshot_queue.put(json.loads(json.dumps(screenshot_data, default=str)))
-			except Exception as e:
-				logger.error(f"Error serializing screenshot data: {e}")
+				
+			# Add to separate screenshot queue
+			await self.screenshot_queue.put(json.loads(json.dumps({
+				"type": "screenshot",
+				"data": screenshot_data
+			}, default=str)))
 		
-		# Convert state data to proper JSON format (ensure None becomes null)
-		import json
-		
+		# Convert to proper JSON format (ensure None becomes null)
 		# Put the state data in the queue - ensure it's properly JSON serialized
-		try:
-			await self.state_queue.put(json.loads(json.dumps(state_data, default=str)))
-		except Exception as e:
-			logger.error(f"Error serializing state data: {e}")
-			await self.state_queue.put(json.loads(json.dumps({"error": str(e), "task_id": self.task_id, "step_number": step_number}, default=str)))
+		await self.state_queue.put(json.loads(json.dumps(state_data, default=str)))
+	
+		# If this requires input, auto-pause the agent
+		if requires_input:
+			logger.info(f"Task {self.task_id} paused waiting for human input")
+			self._paused_for_input = True
+			await self.pause()
 	
 	async def done_callback(self, agent_history):
 		"""Callback when the agent is done"""
@@ -334,9 +314,16 @@ class AgentTask:
 		if self.agent:
 			self.agent.pause()
 	
-	async def resume(self):
-		"""Resume the agent task"""
+	async def resume(self, user_input=None):
+		"""Resume the agent task, optionally with user input"""
 		if self.agent:
+			# If we have user input and the task was paused waiting for input
+			if user_input and self._paused_for_input:
+				logger.info(f"Resuming task {self.task_id} with user input: {user_input}")
+				self._paused_for_input = False
+				self.agent.add_new_task(f'Continue the task with this user input: {user_input}')
+			
+			# Resume the agent
 			self.agent.resume()
 	
 	@property
@@ -370,6 +357,8 @@ class MultiAgentManager:
 		self.tasks: Dict[str, AgentTask] = {}
 		self.redis_client = None
 		self.use_redis = False
+		# Create a shared controller for all agents
+		self.shared_controller = HumanHelpController()
 		
 		# Initialize Redis if URL is provided and Redis is available
 		if redis_url and REDIS_AVAILABLE:
@@ -409,10 +398,12 @@ class MultiAgentManager:
 					pattern = "browser_task:*"
 					async for key in self.redis_client.scan_iter(match=pattern):
 						try:
-							task_data = await self.redis_client.get(key)
-							if task_data:
-								task_info = json.loads(task_data)
-								if "last_activity_time" in task_info and (current_time - task_info["last_activity_time"]) > (max_age_hours * 3600):
+							# Get the last_activity_time field from the hash instead of getting the entire JSON
+							last_activity_time = await self.redis_client.hget(key, "last_activity_time")
+							if last_activity_time:
+								# Convert string to float
+								last_activity_time = float(last_activity_time)
+								if (current_time - last_activity_time) > (max_age_hours * 3600):
 									await self.redis_client.delete(key)
 									logger.info(f"Cleaned up Redis key {key}")
 						except Exception as e:
@@ -429,9 +420,9 @@ class MultiAgentManager:
 		if not task_id:
 			task_id = str(uuid.uuid4())
 			
-		# Create and initialize the task
+		# Create and initialize the task with shared controller
 		task = AgentTask(task_id, task_description, model, headless)
-		await task.initialize()
+		await task.initialize(controller=self.shared_controller)
 		
 		# Store the task
 		self.tasks[task_id] = task
@@ -447,7 +438,9 @@ class MultiAgentManager:
 				"last_activity_time": task.last_activity_time,
 				"status": "created"
 			}
-			await self.redis_client.set(f"browser_task:{task_id}", json.dumps(task_info))
+			# Convert task_info to individual hash fields instead of using SET with a JSON string
+			for key, value in task_info.items():
+				await self.redis_client.hset(f"browser_task:{task_id}", key, str(value))
 			
 		return task_id
 	
@@ -498,11 +491,12 @@ class MultiAgentManager:
 			return True
 		return False
 	
-	async def resume_task(self, task_id: str) -> bool:
-		"""Resume a task by ID"""
+	async def resume_task(self, task_id: str, user_input=None) -> bool:
+		"""Resume a task by ID, optionally with user input"""
 		task = await self.get_task(task_id)
 		if task:
-			await task.resume()
+			# Resume with user input if provided
+			await task.resume(user_input)
 			
 			# Update Redis if available
 			if self.use_redis and self.redis_client:
@@ -577,7 +571,7 @@ agent_manager = MultiAgentManager(redis_url)
 
 @app.post('/api/browser-use/tasks/')
 async def create_task(request: TaskRequest):
-	"""Create a task without starting it"""
+	"""Create a new browser task without starting it"""
 	global agent_manager
 	try:
 		# Create a new task with the provided task_id or generate one
@@ -608,8 +602,8 @@ async def create_task(request: TaskRequest):
 		task = await agent_manager.get_task(task_id)
 		if not task:
 			raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
-
-		# Return task info with URLs for state and screenshot streams
+		
+		# Return task info with stream URLs for compatibility with TypeScript client
 		return {
 			"task_id": task_id,
 			"status": "created",
@@ -620,8 +614,129 @@ async def create_task(request: TaskRequest):
 			"browser_debug_url": task.browser_debug_url
 		}
 	except Exception as e:
+		logger.error(f"Error creating task: {e}")
+		raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put('/api/browser-use/tasks/{task_id}/run')
+async def run_and_stream(task_id: str, resume_request: ResumeTaskRequest = None):
+	"""Run and stream a browser task, or resume it with user input"""
+	global agent_manager
+	try:
+		# Get the task
+		task = await agent_manager.get_task(task_id)
+		if not task:
+			raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+		
+		# Check if task is already running
+		if task.is_running and not resume_request:
+			logger.info(f"Task {task_id} is already running")
+		# Otherwise start or resume the task
+		else:
+			if resume_request.input_text:
+				# Resume with user input
+				await agent_manager.resume_task(task_id, resume_request)
+				logger.info(f"Resumed task {task_id} with user input")
+			else:
+				# Start the task
+				await agent_manager.run_task(task_id)
+				logger.info(f"Started task {task_id}")
+
+		# Stream state updates
+		async def generate():
+			while True:
+				# Process state updates
+				try:
+					# Use wait_for to avoid blocking indefinitely
+					state_data = await asyncio.wait_for(task.state_queue.get(), 0.5)
+					
+					if 'type' in state_data and state_data['type'] == 'result':
+						# This is the final result
+						logger.info(f'📄 Result for task {task_id}: {state_data["data"]}')
+						# Ensure proper JSON serialization for completion event
+						yield {"event": "complete", "data": json.dumps(state_data, default=str)}
+						break
+					elif 'requires_input' in state_data and state_data['requires_input']:
+						# This state requires human input
+						logger.info(f'👤 Task {task_id} requires human input')
+						yield {"event": "requires_input", "data": json.dumps(state_data, default=str)}
+					else:
+						# Regular state update
+						yield {"event": "state", "data": json.dumps(state_data, default=str)}
+				except asyncio.TimeoutError:
+					# No updates in the timeout period
+					pass
+				except asyncio.CancelledError:
+					# Stream was cancelled
+					break
+				except Exception as e:
+					logger.error(f"Error in state stream for task {task_id}: {e}")
+					yield {"event": "error", "data": json.dumps({"error": str(e)}, default=str)}
+					break
+				
+				# Check if task is complete
+				if task.task_completed and task.state_queue.empty():
+					yield {"event": "complete", "data": json.dumps({"message": "Task completed", "task_id": task_id}, default=str)}
+					break
+
+		return EventSourceResponse(generate())
+	except Exception as e:
 		logger.error(f"Error in run_and_stream: {e}")
 		raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get('/api/browser-use/tasks/{task_id}/screenshots')
+async def stream_screenshots(task_id: str):
+	"""Stream screenshots for a specific browser task"""
+	try:
+		# Get the task
+		task = await agent_manager.get_task(task_id)
+		if not task:
+			raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
+		
+		# Stream screenshots
+		async def generate():
+			while True:
+				try:
+					# Use wait_for to avoid blocking indefinitely
+					screenshot_data = await asyncio.wait_for(task.screenshot_queue.get(), 0.5)
+					
+					# Check if we have a screenshot_url or screenshot data
+					screenshot_event_data = screenshot_data['data']
+					
+					# Ensure compatibility with TypeScript client - data must be a JSON string
+					yield {"event": "screenshot", "data": json.dumps(screenshot_event_data, default=str)}
+				except asyncio.TimeoutError:
+					# No screenshots in the timeout period
+					pass
+				except asyncio.CancelledError:
+					# Stream was cancelled
+					break
+				except Exception as e:
+					logger.error(f"Error in screenshot stream for task {task_id}: {e}")
+					yield {"event": "error", "data": json.dumps({"error": str(e)}, default=str)}
+					break
+				
+				# Check if task is complete and no more screenshots
+				if task.task_completed and task.screenshot_queue.empty():
+					# Just continue; don't break the stream as more screenshots might come
+					pass
+
+		return EventSourceResponse(generate())
+	except Exception as e:
+		logger.error(f"Error in stream_screenshots: {e}")
+		raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get('/health')
+async def health_check():
+	return {
+		'status': 'healthy',
+		'version': '1.0.0',
+		'service': 'browser-use',
+		'redis_enabled': agent_manager.use_redis
+	}
+
 
 @app.get('/api/browser-use/tasks')
 async def list_tasks():
@@ -660,10 +775,15 @@ async def pause_task(task_id: str):
 
 
 @app.post('/api/browser-use/tasks/{task_id}/resume')
-async def resume_task(task_id: str):
-	"""Resume a specific browser task"""
+async def resume_task(task_id: str, resume_request: ResumeTaskRequest = None):
+	"""Resume a specific browser task, optionally with user input"""
 	try:
-		success = await agent_manager.resume_task(task_id)
+		# Process user input if provided
+		user_input = None
+		if resume_request:
+			user_input = resume_request
+			
+		success = await agent_manager.resume_task(task_id, user_input)
 		if not success:
 			raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
 		return {'status': 'resumed', 'task_id': task_id}
@@ -692,195 +812,6 @@ async def get_task_info(task_id: str):
 	if not task_status:
 		raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
 	return task_status
-
-
-class UserInput(BaseModel):
-	"""Model for user input to a task"""
-	input_text: Optional[str] = None
-	selected_option: Optional[str] = None
-	other_data: Optional[Dict[str, Any]] = None
-
-
-@app.put('/api/browser-use/tasks/{task_id}/run')
-async def run_and_stream_task(task_id: str, user_input: Optional[UserInput] = None):
-	"""Start and stream a task, optionally with user input
-	
-	This endpoint supports two modes:
-	1. Starting a new task or continuing a running task (no user input)
-	2. Providing user input to a task that is waiting for input (with user_input)
-	"""
-	try:
-		# Get the task
-		task = await agent_manager.get_task(task_id)
-		if not task:
-			raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
-		
-		# Check if the task is waiting for input
-		is_waiting_for_input = getattr(task, 'waiting_for_input', False)
-		
-		# If user input is provided, handle it
-		if user_input:
-			user_input_dict = user_input.dict(exclude_none=True)
-			logger.info(f"Received user input for task {task_id}: {user_input_dict}")
-			
-			# Store the user input in the task
-			if not hasattr(task, 'user_inputs'):
-				task.user_inputs = []
-			
-			# Add timestamp to track when input was received
-			user_input_dict['timestamp'] = datetime.now().isoformat()
-			task.user_inputs.append(user_input_dict)
-			
-			# If the task was waiting for input, resume it
-			if is_waiting_for_input:
-				logger.info(f"Resuming task {task_id} with user input")
-				
-				# Set the latest user input for the agent to access
-				task.latest_user_input = user_input_dict
-				
-				# Signal that input has been provided
-				task.waiting_for_input = False
-				
-				# If the task has an input_event, set it to resume the task
-				if hasattr(task, 'input_event') and task.input_event:
-					task.input_event.set()
-					logger.info(f"Signaled task {task_id} to resume")
-				
-				# Emit a state update indicating input was received
-				await task.state_queue.put({
-					'type': 'state',
-					'data': {
-						'message': 'User input received, resuming task',
-						'input_received': True,
-						'input_type': user_input_dict.get('input_type', 'text')
-					}
-				})
-				
-		# Start the task if it's not already running and not waiting for input
-		if not task.is_running and not is_waiting_for_input:
-			# Start the task in the background
-			asyncio.create_task(task.run())
-			logger.info(f"Started task {task_id}")
-		
-		# Stream state updates
-		async def generate():
-			while True:
-				# Process state updates
-				try:
-					# Use wait_for to avoid blocking indefinitely
-					state_data = await asyncio.wait_for(task.state_queue.get(), 0.1)
-					
-					if 'type' in state_data and state_data['type'] == 'result':
-						# This is the final result
-						logger.info(f'📄 Result for task {task_id}: {state_data["data"]}')
-						# Ensure proper JSON serialization for completion event
-						import json
-						yield {"event": "complete", "data": json.dumps(state_data, default=str)}
-						break
-					else:
-						# Check if this state update indicates the task needs user input
-						if state_requires_input(state_data):
-							# Mark the task as waiting for input
-							task.waiting_for_input = True
-							
-							# Create an event that will be set when input is received
-							if not hasattr(task, 'input_event'):
-								task.input_event = asyncio.Event()
-							else:
-								task.input_event.clear()
-							
-							# Extract input requirements
-							input_requirements = extract_input_requirements(state_data)
-							
-							# Add input requirements to the state data
-							state_data['requires_input'] = True
-							state_data['input_requirements'] = input_requirements
-							
-							logger.info(f"Task {task_id} requires user input: {input_requirements}")
-							
-							# Emit the state update with input requirements
-							import json
-							yield {"event": "state", "data": json.dumps(state_data, default=str)}
-							
-							# Wait for the input event to be set (with a timeout)
-							try:
-								# Check periodically if the event is set
-								while not task.input_event.is_set():
-									try:
-										# Wait with a timeout to allow for cancellation
-										await asyncio.wait_for(task.input_event.wait(), 1.0)
-										break  # Event was set, exit the loop
-									except asyncio.TimeoutError:
-										# Check if the client is still connected
-										if not await request.is_disconnected():
-											continue  # Client still connected, keep waiting
-										else:
-											logger.warning(f"Client disconnected while waiting for input for task {task_id}")
-											break  # Client disconnected, exit the loop
-							except Exception as e:
-								logger.error(f"Error waiting for user input: {e}")
-						else:
-							# This is a regular state update
-							import json
-							yield {"event": "state", "data": json.dumps(state_data, default=str)}
-				except asyncio.TimeoutError:
-					pass  # No state updates available, continue
-				except Exception as e:
-					logger.error(f"Error processing state update: {e}")
-					# Yield error event
-					yield {"event": "error", "data": json.dumps({"error": str(e)}, default=str)}
-				
-				# Check if task is complete
-				if task.task_completed and task.state_queue.empty():
-					yield {"event": "complete", "data": json.dumps({"message": "Task completed", "task_id": task_id}, default=str)}
-					break
-				
-				await asyncio.sleep(0.1)
-		
-		return EventSourceResponse(generate())
-	except Exception as e:
-		logger.error(f"Error in run_and_stream_task: {e}")
-		raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.get('/api/browser-use/tasks/{task_id}/screenshots')
-async def stream_task_screenshots(task_id: str):
-	"""Stream screenshot updates for a specific task"""
-	try:
-		# Get the task
-		task = await agent_manager.get_task(task_id)
-		if not task:
-			raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
-		
-		# Stream screenshot updates
-		async def generate():
-			while True:
-				# Process screenshot updates
-				try:
-					# Use wait_for to avoid blocking indefinitely
-					screenshot_data = await asyncio.wait_for(task.screenshot_queue.get(), 0.1)
-					
-					# This is a screenshot update
-					import json
-					yield {"event": "screenshot", "data": json.dumps(screenshot_data, default=str)}
-				except asyncio.TimeoutError:
-					pass  # No screenshot updates available, continue
-				except Exception as e:
-					logger.error(f"Error processing screenshot update: {e}")
-					# Yield error event
-					yield {"event": "error", "data": json.dumps({"error": str(e)}, default=str)}
-				
-				# Check if task is complete
-				if task.task_completed and task.screenshot_queue.empty():
-					yield {"event": "complete", "data": json.dumps({"message": "Task completed", "task_id": task_id}, default=str)}
-					break
-				
-				await asyncio.sleep(0.1)
-		
-		return EventSourceResponse(generate())
-	except Exception as e:
-		logger.error(f"Error in stream_task_screenshots: {e}")
-		raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get('/api/browser-use/health')
