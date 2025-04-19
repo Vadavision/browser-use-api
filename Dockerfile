@@ -1,8 +1,8 @@
-FROM --platform=linux/amd64 python:3.11-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Chrome dependencies
+# Install Chromium and other dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -26,29 +26,28 @@ RUN apt-get update && apt-get install -y \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
+    git \
+    chromium \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Chrome using a more reliable method
-RUN apt-get update && apt-get install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    gnupg \
-    --no-install-recommends \
-    && curl -sSL https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install dependencies
+# Copy requirements and install dependencies in a specific order to avoid conflicts
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (after requirements.txt installation)
-RUN playwright install chromium && playwright install-deps chromium
+# Install core dependencies first
+RUN pip install --no-cache-dir fastapi uvicorn pydantic sse-starlette python-multipart redis aioredis boto3
+
+# Install langchain-core at the specific version required by browser-use
+RUN pip install --no-cache-dir langchain-core==0.3.49
+
+# Install browser dependencies
+RUN pip install --no-cache-dir playwright==1.51.0 patchright==1.51.3
+
+# Install langchain packages with --no-deps to avoid conflicts
+RUN pip install --no-cache-dir --no-deps langchain==0.3.21 langchain-openai==0.3.11
+
+# Install browser-use with --no-deps to avoid dependency conflicts
+RUN pip install --no-cache-dir --no-deps git+https://github.com/neo773/browser-use.git@bot-detection-batch
 
 # Create directories for logs and states
 RUN mkdir -p /app/logs/states /app/logs/videos
@@ -60,8 +59,10 @@ COPY . .
 EXPOSE 8000
 
 # Set environment variables
+ENV PLAYWRIGHT_BROWSERS_PATH=0
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV CHROMIUM_PATH=/usr/bin/chromium
 ENV PYTHONUNBUFFERED=1
-ENV PLAYWRIGHT_BROWSERS_PATH=/app/browser_data
 
 # Run the application
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
