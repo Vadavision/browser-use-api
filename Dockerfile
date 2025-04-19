@@ -50,6 +50,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Playwright browsers (after requirements.txt installation)
 RUN playwright install chromium && playwright install-deps chromium
 
+# Create directories for logs and states
+RUN mkdir -p /app/logs/states /app/logs/videos
+
 # Copy application code
 COPY . .
 
@@ -58,6 +61,7 @@ EXPOSE 8000
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/browser_data
 
 # Run the application
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

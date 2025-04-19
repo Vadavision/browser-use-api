@@ -12,6 +12,8 @@ The Browser Use API is a FastAPI-based service that provides browser automation 
 - **Real-time updates**: Uses Server-Sent Events (SSE) to stream progress updates
 - **Redis integration**: Leverages Redis for state management and task coordination
 - **S3 screenshot storage**: Optionally stores screenshots in S3 and returns URLs instead of base64 data
+- **Enhanced stealth capabilities**: Integrates with patchright for improved bot detection avoidance
+- **Cloud browser support**: Can connect to external cloud browsers for enhanced reliability and stealth
 - **Health check endpoint**: Supports Kubernetes health probes
 - **Containerized**: Packaged as a Docker container for easy deployment
 
@@ -39,6 +41,33 @@ The Browser Use API is deployed alongside the main NestJS backend using Kubernet
 3. Install Playwright browsers: `playwright install`
 4. Set up environment variables (see `.env.example`)
 5. Run the service: `uvicorn main:app --reload`
+
+### Environment Variables
+
+The following environment variables can be configured:
+
+```
+# Redis Configuration (Optional)
+REDIS_URL=redis://localhost:6379
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+# AWS S3 Configuration (Optional)
+AWS_ACCESS_KEY_ID=your_aws_access_key_here
+AWS_SECRET_ACCESS_KEY=your_aws_secret_key_here
+AWS_REGION=us-east-1
+S3_BUCKET_NAME=your-screenshot-bucket
+S3_PREFIX=screenshots
+
+# Cloud Browser Configuration (Optional)
+CLOUD_BROWSER_URL=wss://your-cloud-browser-provider.com/browser/ws-endpoint
+
+# Proxy Configuration (Optional)
+USE_PROXY=true
+PROXY_SERVER=geo.iproyal.com:12321
+PROXY_USERNAME=your_proxy_username
+PROXY_PASSWORD=your_proxy_password
+```
 
 ## API Endpoints
 
@@ -77,6 +106,80 @@ S3_PREFIX=screenshots  # Folder prefix within the bucket
 1. When S3 is properly configured, screenshots are uploaded to the specified S3 bucket
 2. The API returns a `screenshot_url` field instead of the `screenshot` field in the state updates
 3. If S3 upload fails or is not configured, the API falls back to including the raw screenshot data
+
+## Cloud Browser Integration
+
+The API supports connecting to external cloud browsers instead of launching local browsers. This provides several benefits:
+
+1. **Enhanced stealth**: Cloud browsers often have better fingerprinting protection
+2. **Improved reliability**: Avoid local browser installation and compatibility issues
+3. **Distributed IP addresses**: Cloud browsers can provide access from different geographic locations
+4. **Resource efficiency**: Offload browser processing to external services
+
+### Configuration
+
+To use a cloud browser, set the following environment variable:
+
+```
+CLOUD_BROWSER_URL=wss://your-cloud-browser-provider.com/browser/ws-endpoint
+```
+
+The URL can be either:
+- A WebSocket URL (starting with `wss://`)
+- A Chrome DevTools Protocol URL (typically `http://hostname:port`)
+
+### Recommended Cloud Browser Providers
+
+- **BrowserStack**: Enterprise-grade cloud browser platform
+- **Browserless.io**: Purpose-built for automation
+- **Browser-use Cloud**: Native integration with browser-use
+- **Bright Data's Unblocker**: Specialized anti-detection cloud browser
+
+### Testing Cloud Browser Integration
+
+Use the included test script to verify cloud browser functionality:
+
+```bash
+# Set the cloud browser URL
+export CLOUD_BROWSER_URL="wss://your-cloud-browser-provider.com/browser/ws-endpoint"
+
+# Run the test script
+python test_cloud_browser.py
+```
+
+## Proxy Integration
+
+The Browser Use API supports connecting through proxy servers to enhance anonymity and avoid IP-based blocking. This is particularly useful for bot detection avoidance and accessing geo-restricted content.
+
+### Configuration
+
+To use a proxy server, set the following environment variables:
+
+```
+USE_PROXY=true
+PROXY_SERVER=geo.iproyal.com:12321  # Proxy server address and port
+PROXY_USERNAME=your_proxy_username  # Proxy authentication username
+PROXY_PASSWORD=your_proxy_password  # Proxy authentication password
+```
+
+### Supported Proxy Providers
+
+- **IPRoyal**: Residential and datacenter proxies with geo-targeting
+- **Bright Data**: Enterprise-grade proxy network
+- **Oxylabs**: Residential and datacenter proxies
+- **Any HTTP proxy**: Standard HTTP proxies with authentication
+
+## Enhanced Stealth Capabilities
+
+The API integrates with patchright to provide enhanced stealth capabilities, making browser automation less detectable. Key features include:
+
+- **WebDriver fingerprint masking**: Prevents detection of automation frameworks
+- **Browser fingerprint normalization**: Makes automated browsers appear more like regular users
+- **User agent spoofing**: Uses realistic user agents that match browser versions
+- **Hardware fingerprint simulation**: Simulates realistic hardware characteristics
+- **Timezone and locale settings**: Configures browser to use consistent geographic settings
+
+These stealth capabilities significantly improve success rates when interacting with websites that employ bot detection mechanisms.
 
 ## Integration
 

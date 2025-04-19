@@ -18,10 +18,66 @@ from sse_starlette.sse import EventSourceResponse
 # Import S3 uploader
 from s3_utils import s3_uploader
 
-from browser_use import Agent
+from browser_use import Agent, Browser
 from custom_controller import HumanHelpController
-from browser_use.browser.context import BrowserContext, BrowserContextConfig
+from browser_use import BrowserConfig, BrowserContextConfig
+# Use patchright's BrowserContext when available, otherwise fallback to browser_use's
+try:
+    from patchright.async_api import BrowserContext
+    PATCHRIGHT_AVAILABLE = True
+    print("Using patchright.async_api.BrowserContext for enhanced stealth capabilities")
+except ImportError:
+    from browser_use.browser.context import BrowserContext
+    PATCHRIGHT_AVAILABLE = False
+    print("Falling back to browser_use.browser.context.BrowserContext")
 
+# IPRoyal proxy settings
+PROXY_ENABLED = os.environ.get("USE_PROXY", "false").lower() == "true"
+PROXY_SERVER = os.environ.get("PROXY_SERVER")
+PROXY_USERNAME = os.environ.get("PROXY_USERNAME")
+PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD")
+
+# Log proxy status
+if PROXY_ENABLED:
+    print(f"Proxy enabled: {PROXY_SERVER}")
+else:
+    print("Proxy disabled. Set USE_PROXY=true to enable proxy.")
+
+# Patch Playwright connection to handle KeyError: 'error'
+try:
+    from playwright._impl._connection import Connection
+    
+    # Store the original dispatch method
+    original_dispatch = Connection.dispatch
+    
+    # Create a patched version that handles the KeyError
+    def patched_dispatch(self, msg):
+        try:
+            return original_dispatch(self, msg)
+        except KeyError as e:
+            # Handle the specific KeyError: 'error'
+            if str(e) == "'error'":
+                # Just log it and continue
+                logging.getLogger("playwright").warning(f"Ignoring KeyError in Playwright dispatch: {e}")
+                return None
+            # Re-raise other KeyErrors
+            raise
+    
+    # Apply the monkey patch
+    Connection.dispatch = patched_dispatch
+    print("Patched Playwright connection to handle KeyError: 'error'")
+except Exception as e:
+    print(f"Failed to patch Playwright connection: {e}")
+
+# Add patchright import - will be used if available
+try:
+    import patchright
+    # Standard patchright import without monkey patching
+    PATCHRIGHT_AVAILABLE = True
+    print("Patchright is available and will be used for enhanced stealth mode")
+except ImportError:
+    PATCHRIGHT_AVAILABLE = False
+    print("Patchright is not available. Install with: pip install patchright")
 
 # Optional Redis imports - will be used if available
 try:
@@ -116,48 +172,128 @@ class AgentTask:
 	
 	async def initialize(self, controller=None):
 		"""Initialize the agent with browser and optional controller"""
-		llm = ChatOpenAI(model=self.model)
-		
-		# Create a Browser instance with remote debugging enabled
-		from browser_use import Browser, BrowserConfig
-		
-		# Configure browser with remote debugging enabled
-		extra_args = [
-			f'--remote-debugging-port={self.remote_debugging_port}',
-			'--remote-debugging-address=0.0.0.0'  # Allow external connections
-		]
-		
-		browser_config = BrowserConfig(
-			headless=self.headless,
-			extra_chromium_args=extra_args
-		)
-
-		config = BrowserContextConfig(
-			highlight_elements=False,
-		)
-		
-		browser = Browser(config=browser_config)
-		context = BrowserContext(browser=browser, config=config)
-		
-		
-		# Create agent with the configured browser and controller if provided
-		self.agent = Agent(
-			task=self.task_description, 
-			llm=llm, 
-			browser=browser,
-			browser_context=context,
-			controller=controller
-		)
-		self._running = False
-		
-		# Set the debug URL (will be available after the browser is launched)
-		self.browser_debug_url = f'http://localhost:{self.remote_debugging_port}'
-		
-		# Register callbacks
-		self.agent.register_new_step_callback = self.step_callback
-		self.agent.register_done_callback = self.done_callback
-		
-		return self
+		try:
+			# Configure extra browser arguments for stealth mode (used for local browser)
+			extra_args = [
+				f'--remote-debugging-port={self.remote_debugging_port}',
+				'--remote-debugging-address=0.0.0.0',  # Allow external connections
+				'--disable-blink-features=AutomationControlled',  # Hide automation flags
+				'--disable-infobars',
+				'--disable-dev-shm-usage',  # Overcome limited /dev/shm size in containers
+				'--no-sandbox',  # Required for running in containers
+				'--disable-setuid-sandbox',  # Additional sandbox disabling for containers
+			]
+			
+			# Log whether patchright is being used
+			if PATCHRIGHT_AVAILABLE:
+				logger.info("Using patchright for enhanced stealth capabilities")
+				# Add additional stealth-focused arguments when patchright is available
+				extra_args.extend([
+					'--disable-features=IsolateOrigins,site-per-process',  # Disable site isolation for better stealth
+					'--disable-web-security',  # Disable web security for better functionality
+					'--disable-site-isolation-trials'  # Disable site isolation trials
+				])
+			else:
+				logger.warning("Patchright not available - stealth capabilities will be limited")
+			
+			browser = None
+			
+			# Configure browser with proxy if enabled
+			if PROXY_ENABLED and PROXY_SERVER and PROXY_USERNAME and PROXY_PASSWORD:
+				logger.info(f"Configuring browser with proxy: {PROXY_SERVER}")
+				
+				# Configure proxy settings
+				proxy_settings = {
+					"server": f"http://{PROXY_SERVER}",
+					"username": PROXY_USERNAME,
+					"password": PROXY_PASSWORD
+				}
+				
+				# Create browser config with proxy settings and enhanced stealth
+				browser_config = BrowserConfig(
+					headless=self.headless,
+					channel="chrome",
+					connection_timeout=60000,  # 60 seconds timeout for more reliable connection
+					proxy=proxy_settings,
+					extra_chromium_args=extra_args,
+					# Enhanced stealth settings
+					bypass_csp=True,  # Bypass Content Security Policy for better functionality
+					ignore_https_errors=True,  # Ignore HTTPS errors
+					has_touch=True,  # Simulate touch capability
+					is_mobile=False,  # Don't simulate mobile device
+					locale="en-US",  # Set locale to US English
+					timezone_id="America/New_York",  # Set timezone to US East Coast
+					user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"  # Use a common user agent
+				)
+				
+				# Create browser with proxy config
+				browser = Browser(config=browser_config)
+				
+				# Create the browser context
+				context = await browser.new_context()
+				
+				# Set the debug URL for local browser
+				self.browser_debug_url = f'http://localhost:{self.remote_debugging_port}'
+			else:
+				# Use standard local browser without proxy
+				logger.info("Using standard browser configuration without proxy")
+				
+				# Create local browser config with standard browser-use options and enhanced stealth
+				browser_config = BrowserConfig(
+					headless=self.headless,
+					channel="chrome",  # Use Chrome instead of Chromium for better stealth
+					extra_chromium_args=extra_args,
+					# Enhanced stealth settings
+					bypass_csp=True,  # Bypass Content Security Policy for better functionality
+					ignore_https_errors=True,  # Ignore HTTPS errors
+					has_touch=True,  # Simulate touch capability
+					is_mobile=False,  # Don't simulate mobile device
+					locale="en-US",  # Set locale to US English
+					timezone_id="America/New_York",  # Set timezone to US East Coast
+					user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"  # Use a common user agent
+				)
+				
+				# Create browser with local config
+				browser = Browser(config=browser_config)
+				
+				# Create the browser context
+				context = await browser.new_context()
+				
+				# Set the debug URL for local browser
+				self.browser_debug_url = f'http://localhost:{self.remote_debugging_port}'
+			
+			# Create custom controller if not provided
+			if controller is None:
+				controller = HumanHelpController(
+					task_id=self.task_id,
+					state_queue=self.state_queue,
+					screenshot_queue=self.screenshot_queue
+				)
+			
+			# Initialize LLM
+			llm = ChatOpenAI(model=self.model)
+			
+			# Create agent with the configured browser and controller
+			self.agent = Agent(
+				task=self.task_description, 
+				llm=llm, 
+				browser_context=context,
+				controller=controller
+			)
+			
+			# Store browser for cleanup
+			self._browser = browser
+			
+			# Register callbacks
+			self.agent.register_new_step_callback = self.step_callback
+			self.agent.register_done_callback = self.done_callback
+			
+			self._running = False
+			
+			return self
+		except Exception as e:
+			logger.error(f"Error initializing agent: {e}")
+			raise
 	
 	async def step_callback(self, browser_state, agent_output, step_number):
 		"""Callback for each step of the agent"""
@@ -266,12 +402,27 @@ class AgentTask:
 		
 		# Get the final result
 		final_result = None
-		if agent_history and len(agent_history.steps) > 0:
-			last_step = agent_history.steps[-1]
-			if last_step and last_step.results and len(last_step.results) > 0:
-				last_result = last_step.results[-1]
-				if hasattr(last_result, 'extracted_content'):
-					final_result = last_result.extracted_content
+		if agent_history:
+			# Use the correct method to access history data
+			# AgentHistoryList in newer versions doesn't have 'steps' attribute
+			try:
+				# Try to get the final result using the final_result method
+				final_result = agent_history.final_result()
+			except (AttributeError, TypeError):
+				# Fallback if final_result method is not available
+				try:
+					# Try to access action_results if available
+					action_results = agent_history.action_results()
+					if action_results and len(action_results) > 0:
+						final_result = action_results[-1]
+				except (AttributeError, TypeError):
+					# Final fallback - try to extract content from the history
+					try:
+						extracted = agent_history.extracted_content()
+						if extracted:
+							final_result = extracted
+					except (AttributeError, TypeError):
+						logger.warning("Could not extract final result from agent history")
 		
 		# Put the final result in the queue
 		await self.state_queue.put({
@@ -372,8 +523,8 @@ class MultiAgentManager:
 		else:
 			logger.info("Using in-memory storage for task state")
 		
-		# Start background task for cleanup
-		asyncio.create_task(self._cleanup_old_tasks())
+		# We'll initialize the cleanup task when the event loop is running
+		self._cleanup_task = None
 	
 	async def _cleanup_old_tasks(self, max_age_hours: int = 24, check_interval: int = 3600):
 		"""Periodically clean up old completed tasks"""
@@ -583,20 +734,20 @@ async def create_task(request: TaskRequest):
 			if request.redis_url:
 				agent_manager = MultiAgentManager(request.redis_url)
 				logger.info(f"Using Redis URL from request: {request.redis_url}")
-			# Priority 2: Construct URL from redis_host and redis_port if provided in the request
+			# Priority 2: Use redis_host and redis_port if provided
 			elif request.redis_host:
-				port = request.redis_port or 6379
-				constructed_url = f"redis://{request.redis_host}:{port}"
-				agent_manager = MultiAgentManager(constructed_url)
-				logger.info(f"Using Redis connection from request parameters: {request.redis_host}:{port}")
+				redis_port = request.redis_port or 6379
+				redis_url = f"redis://{request.redis_host}:{redis_port}"
+				agent_manager = MultiAgentManager(redis_url)
+				logger.info(f"Using Redis from request: {request.redis_host}:{redis_port}")
+		
+		# Start the cleanup task if not already started
+		if agent_manager._cleanup_task is None:
+			agent_manager._cleanup_task = asyncio.create_task(agent_manager._cleanup_old_tasks())
+			logger.info("Started background cleanup task")
 		
 		# Create the task
-		task_id = await agent_manager.create_task(
-			task_description=request.task,
-			task_id=task_id,
-			model=request.model,
-			headless=request.headless
-		)
+		await agent_manager.create_task(request.task, task_id, request.model, request.headless)
 		
 		# Get the task
 		task = await agent_manager.get_task(task_id)
@@ -633,7 +784,7 @@ async def run_and_stream(task_id: str, resume_request: ResumeTaskRequest = None)
 			logger.info(f"Task {task_id} is already running")
 		# Otherwise start or resume the task
 		else:
-			if resume_request.input_text:
+			if resume_request and resume_request.input_text:
 				# Resume with user input
 				await agent_manager.resume_task(task_id, resume_request)
 				logger.info(f"Resumed task {task_id} with user input")
