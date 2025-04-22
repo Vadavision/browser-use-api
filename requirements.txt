@@ -1,12 +1,7 @@
 # Core dependencies
-browser-use @ git+https://github.com/neo773/browser-use.git@bot-detection-batch
 fastapi>=0.95.0
 uvicorn>=0.22.0
 pydantic>=2.0.0
-
-# For OpenAI integration
-langchain>=0.0.267
-langchain-openai>=0.0.2
 
 # For Server-Sent Events
 sse-starlette>=1.6.5
@@ -25,8 +20,7 @@ redis>=5.0.0
 aioredis>=2.0.0  # For async Redis operations
 
 # For browser automation
-playwright>=1.51.0
-patchright>=1.51.0  # Enhanced stealth mode for browser automation
+browser-use
 
 # For S3 integration
 boto3>=1.28.0

@@ -17,7 +17,7 @@ class S3Uploader:
         self.aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
         self.aws_region = os.environ.get('AWS_REGION', 'us-east-1')
         self.bucket_name = os.environ.get('AWS_S3_BUCKET')
-        self.s3_prefix = os.environ.get('S3_PREFIX', 'screenshots')
+        self.s3_prefix = os.environ.get('S3_PREFIX', 'browser-use-api/tasks')
         
         # Check if S3 is configured
         self.is_configured = all([self.aws_access_key, self.aws_secret_key, self.bucket_name])
@@ -49,7 +49,7 @@ class S3Uploader:
                 image_data = base64.b64decode(base64_screenshot)
             
             # Generate a unique filename
-            filename = f"{task_id}_{step_number}_{uuid.uuid4().hex}.png"
+            filename = f"{task_id}/{step_number}_{uuid.uuid4().hex}.png"
             s3_key = f"{self.s3_prefix}/{filename}"
             
             # Upload to S3

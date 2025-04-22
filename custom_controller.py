@@ -1,7 +1,6 @@
 from browser_use import Controller, ActionResult, Browser
 from pydantic import BaseModel
-import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 import logging
 
 logger = logging.getLogger('browser-use-api')
@@ -27,9 +26,8 @@ class HumanHelpController(Controller):
     def register_ask_human(self):
         """Register the ask_human action with the controller"""
         # Register the action with the registry
-        # The function name becomes the action name, so we name it 'ask_human'
         @self.registry.action(
-            'Request input from a human user, such as verification codes or choices',
+            'Request input from user if you\'re unsure about some input like one time password (otp)/verification code, 2fa, sensitive information like passwords or multiple choices, also ask user if you get stuck',
             param_model=AskHumanParams  # Use our parameter model
         )
         async def ask_human(params: AskHumanParams, browser: Browser = None) -> ActionResult:
@@ -43,40 +41,12 @@ class HumanHelpController(Controller):
             Returns:
                 ActionResult with success status and human input when available
             """
-            # Log that we're waiting for human input
-            logger.info(f"🙋 Agent is asking for human input: {params.message}")
+            logger.info(f"Agent is asking for human input: {params.message}")
             
-            # Set a flag in the task to indicate we're waiting for input
-            # This will be handled by the API endpoint
-            if hasattr(browser, 'task'):
-                browser.task.waiting_for_input = True
-                browser.task.input_requirements = {
-                    'message': params.message,
-                    'input_type': params.input_type,
-                    'options': params.options or []
-                }
-                
-                # Create an event that will be set when input is received
-                if not hasattr(browser.task, 'input_event'):
-                    browser.task.input_event = asyncio.Event()
-                else:
-                    browser.task.input_event.clear()
-                    
-                # Wait for the input event to be set
-                await browser.task.input_event.wait()
-                
-                # Get the input that was provided
-                user_input = getattr(browser.task, 'latest_user_input', None)
-                
-                # Return the input as the result
-                return ActionResult(
-                    success=True,
-                    message=f"Received human input: {user_input}",
-                    data=user_input
-                )
-            
-            # If we can't set the waiting_for_input flag, return an error
+            # Simply return success - the main.py will handle the pause/resume
+            # and adding the input to the agent's state
             return ActionResult(
-                success=False,
-                message="Could not request human input - browser task not available"
+                success=True,
+                message=f"Requested human input: {params.message}"
             )
+ 
