@@ -119,16 +119,31 @@ class AgentTask:
 				cdp_url=cloud_browser_url
 			)
 		else:
-			browser_config = BrowserConfig(
-				headless=self.headless,
-				extra_chromium_args=[
+			# Base configuration
+			config_args = {
+				'headless': self.headless,
+				'extra_chromium_args': [
 					f'--remote-debugging-port={self.remote_debugging_port}',
 					'--remote-debugging-address=0.0.0.0'  # Allow external connections
 				]
-			)
+			}
+			
+			# Add proxy configuration if USE_PROXY is set to true
+			use_proxy = os.environ.get('USE_PROXY', '').lower() == 'true'
+			if use_proxy and os.environ.get('PROXY_SERVER'):
+				from browser_use.browser.browser import ProxySettings
+				
+				proxy_settings = ProxySettings(
+					server=os.environ.get('PROXY_SERVER'),
+					username=os.environ.get('PROXY_USERNAME'),
+					password=os.environ.get('PROXY_PASSWORD')
+				)
+				config_args['proxy'] = proxy_settings
+			
+			browser_config = BrowserConfig(**config_args)
 
 		config = BrowserContextConfig(
-			highlight_elements=False,
+			highlight_elements=True,
 		)
 		
 		browser = Browser(config=browser_config)
@@ -230,7 +245,9 @@ class AgentTask:
 			screenshot_data = {
 				"task_id": self.task_id,
 				"step_number": step_number,
-				"timestamp": asyncio.get_event_loop().time()
+				"timestamp": asyncio.get_event_loop().time(),
+				"url": browser_state.url,  # Add the current URL to the screenshot data
+				"title": browser_state.title  # Also include the page title
 			}
 			
 			# Add screenshot URL if available, otherwise include base64 data
@@ -698,6 +715,7 @@ async def run_and_stream(task_id: str, resume_request: ResumeTaskRequest = None)
 						yield {"event": "requires_input", "data": json.dumps(state_data, default=str)}
 					else:
 						# Regular state update
+						state_data["step_number"] = state_data.get("step_number", 0)  # Add step number to state data
 						yield {"event": "state", "data": json.dumps(state_data, default=str)}
 				except asyncio.TimeoutError:
 					# No updates in the timeout period
@@ -707,7 +725,7 @@ async def run_and_stream(task_id: str, resume_request: ResumeTaskRequest = None)
 					break
 				except Exception as e:
 					logger.error(f"Error in state stream for task {task_id}: {e}")
-					yield {"event": "error", "data": json.dumps({"error": str(e)}, default=str)}
+					yield {"event": "error", "data": json.dumps({"error": str(e), "task_id": task_id}, default=str)}
 					break
 				
 				# Check if task is complete
