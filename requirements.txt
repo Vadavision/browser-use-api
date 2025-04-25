@@ -13,7 +13,8 @@ python-multipart>=0.0.6
 asyncio>=3.4.3
 
 # For API documentation
-fastapi-utils>=0.2.1
+# Removing fastapi-utils due to dependency conflicts with browser-use 0.1.41
+# fastapi-utils>=0.2.1
 
 # For Redis integration (optional)
 redis>=5.0.0
