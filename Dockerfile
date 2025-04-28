@@ -34,7 +34,13 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install -r requirements.txt
-RUN playwright install chromium
+
+# Install patchright and chromium
+RUN pip install patchright
+RUN patchright install chromium
+
+# Set environment variable to skip LLM API key verification
+ENV SKIP_LLM_API_KEY_VERIFICATION=true
 
 # Copy application code
 COPY . .

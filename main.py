@@ -7,11 +7,20 @@ from queue import Queue
 from threading import Lock
 from typing import Dict, List, Optional, Union, Any
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+# Set flag to skip LLM API key verification
+os.environ['SKIP_LLM_API_KEY_VERIFICATION'] = 'true'
+
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -33,6 +42,13 @@ except ImportError:
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('browser-use-api')
+
+# Log important environment variables for debugging (without exposing sensitive values)
+logger.info("Environment variables loaded:")
+logger.info(f"CLOUD_BROWSER_URL set: {'Yes' if os.environ.get('CLOUD_BROWSER_URL') else 'No'}")
+logger.info(f"OPENAI_API_KEY set: {'Yes' if os.environ.get('OPENAI_API_KEY') else 'No'}")
+logger.info(f"ANTHROPIC_API_KEY set: {'Yes' if os.environ.get('ANTHROPIC_API_KEY') else 'No'}")
+logger.info(f"GOOGLE_API_KEY set: {'Yes' if os.environ.get('GOOGLE_API_KEY') else 'No'}")
 
 # Create a queue for log messages
 log_queue = Queue()
@@ -64,8 +80,9 @@ class TaskRequest(BaseModel):
 	redis_url: Optional[str] = None  # Optional Redis URL for state persistence (legacy format)
 	redis_host: Optional[str] = None  # Optional Redis host (new format)
 	redis_port: Optional[int] = None  # Optional Redis port (new format)
-	model: str = 'gpt-4o-mini'  # LLM model to use
-
+	model: str = 'gpt-4o-mini'  # LLM model to use: 'gpt-4o-mini', 'claude-3-opus-20240229', 'gemini-1.5-pro'
+	model_provider: Optional[str] = None  # Provider: 'openai', 'anthropic', or 'google'
+	api_key: Optional[str] = None  # API key for the model provider
 
 class ResumeTaskRequest(BaseModel):
 	"""Request model for resuming a paused task with user input"""
@@ -76,7 +93,7 @@ class ResumeTaskRequest(BaseModel):
 
 class AgentTask:
 	"""Represents a single agent task with its associated resources"""
-	def __init__(self, task_id: str, task_description: str, model: str = 'gpt-4o-mini', headless: bool = True):
+	def __init__(self, task_id: str, task_description: str, model: str = 'gpt-4o-mini', model_provider: Optional[str] = None, api_key: Optional[str] = None, headless: bool = True):
 		self.task_id = task_id
 		self.task_description = task_description
 		self.agent: Optional[Agent] = None
@@ -87,6 +104,8 @@ class AgentTask:
 		self.screenshot_queue = asyncio.Queue()  # Queue for screenshots
 		self.task_completed = False
 		self.model = model
+		self.model_provider = model_provider
+		self.api_key = api_key
 		self.headless = headless
 		self.creation_time = asyncio.get_event_loop().time()
 		self.last_activity_time = self.creation_time
@@ -104,7 +123,101 @@ class AgentTask:
 	
 	async def initialize(self, controller=None):
 		"""Initialize the agent with browser and optional controller"""
-		llm = ChatOpenAI(model=self.model)
+		# Initialize the appropriate LLM based on model_provider and model
+		if not self.model_provider:
+			# Auto-detect provider based on model name if not explicitly provided
+			if self.model.startswith('gpt-') or self.model.startswith('text-'):
+				self.model_provider = 'openai'
+			elif self.model.startswith('claude-'):
+				self.model_provider = 'anthropic'
+			elif self.model.startswith('gemini-'):
+				self.model_provider = 'google'
+			else:
+				# Default to OpenAI if we can't determine
+				self.model_provider = 'openai'
+				logger.warning(f"Could not determine model provider from model name '{self.model}', defaulting to OpenAI")
+		
+		# Initialize the LLM based on the provider
+		if self.model_provider.lower() == 'openai':
+			# Use provided API key or fall back to environment variable
+			api_key = self.api_key or os.environ.get('OPENAI_API_KEY')
+			if not api_key:
+				raise ValueError("API key is required for OpenAI models. Provide it in the request or set OPENAI_API_KEY environment variable.")
+			
+			# Temporarily set the environment variable for this request if using provided API key
+			original_openai_key = os.environ.get('OPENAI_API_KEY')
+			if self.api_key:
+				os.environ['OPENAI_API_KEY'] = self.api_key
+			
+			try:
+				llm = ChatOpenAI(model=self.model)
+				logger.info(f"Using OpenAI model: {self.model}")
+				
+				# Disable LLM API key verification
+				if hasattr(llm, '_verified_api_keys'):
+					setattr(llm, '_verified_api_keys', True)
+			finally:
+				# Restore original environment variable if we changed it
+				if self.api_key:
+					if original_openai_key:
+						os.environ['OPENAI_API_KEY'] = original_openai_key
+					else:
+						del os.environ['OPENAI_API_KEY']
+				
+		elif self.model_provider.lower() == 'anthropic':
+			# Use provided API key or fall back to environment variable
+			api_key = self.api_key or os.environ.get('ANTHROPIC_API_KEY')
+			if not api_key:
+				raise ValueError("API key is required for Claude models. Provide it in the request or set ANTHROPIC_API_KEY environment variable.")
+			
+			# Temporarily set the environment variable for this request if using provided API key
+			original_anthropic_key = os.environ.get('ANTHROPIC_API_KEY')
+			if self.api_key:
+				os.environ['ANTHROPIC_API_KEY'] = self.api_key
+			
+			try:
+				llm = ChatAnthropic(model=self.model)
+				logger.info(f"Using Anthropic Claude model: {self.model}")
+				
+				# Disable LLM API key verification
+				if hasattr(llm, '_verified_api_keys'):
+					setattr(llm, '_verified_api_keys', True)
+			finally:
+				# Restore original environment variable if we changed it
+				if self.api_key:
+					if original_anthropic_key:
+						os.environ['ANTHROPIC_API_KEY'] = original_anthropic_key
+					else:
+						del os.environ['ANTHROPIC_API_KEY']
+				
+		elif self.model_provider.lower() == 'google':
+			# Use provided API key or fall back to environment variable
+			api_key = self.api_key or os.environ.get('GOOGLE_API_KEY')
+			if not api_key:
+				raise ValueError("API key is required for Google Gemini models. Provide it in the request or set GOOGLE_API_KEY environment variable.")
+			
+			# Temporarily set the environment variable for this request if using provided API key
+			original_google_key = os.environ.get('GOOGLE_API_KEY')
+			if self.api_key:
+				os.environ['GOOGLE_API_KEY'] = self.api_key
+			
+			try:
+				llm = ChatGoogleGenerativeAI(model=self.model)
+				logger.info(f"Using Google Gemini model: {self.model}")
+				
+				# Disable LLM API key verification
+				if hasattr(llm, '_verified_api_keys'):
+					setattr(llm, '_verified_api_keys', True)
+			finally:
+				# Restore original environment variable if we changed it
+				if self.api_key:
+					if original_google_key:
+						os.environ['GOOGLE_API_KEY'] = original_google_key
+					else:
+						del os.environ['GOOGLE_API_KEY']
+			
+		else:
+			raise ValueError(f"Unsupported model provider: {self.model_provider}")
 		
 		# Create a Browser instance with remote debugging enabled
 		from browser_use import Browser, BrowserConfig
@@ -149,23 +262,28 @@ class AgentTask:
 		browser = Browser(config=browser_config)
 		context = BrowserContext(browser=browser, config=config)
 		
-		
-		# Create agent with the configured browser and controller if provided
-		self.agent = Agent(
-			task=self.task_description, 
-			llm=llm, 
-			browser=browser,
-			browser_context=context,
-			controller=controller
-		)
-		self._running = False
-		
-		# Set the debug URL (will be available after the browser is launched)
-		self.browser_debug_url = f'http://localhost:{self.remote_debugging_port}'
-		
-		# Register callbacks
-		self.agent.register_new_step_callback = self.step_callback
-		self.agent.register_done_callback = self.done_callback
+		try:
+			self.agent = Agent(
+				task=self.task_description, 
+				llm=llm, 
+				browser=browser,
+				browser_context=context,
+				controller=controller
+			)
+			self._running = False
+			
+			# Set the debug URL (will be available after the browser is launched)
+			if cloud_browser_url:
+				self.browser_debug_url = cloud_browser_url
+			else:
+				self.browser_debug_url = f'http://localhost:{self.remote_debugging_port}'
+			
+			# Register callbacks
+			self.agent.register_new_step_callback = self.step_callback
+			self.agent.register_done_callback = self.done_callback
+		except Exception as e:
+			logger.error(f"Error creating agent: {e}")
+			raise
 		
 		return self
 	
@@ -265,7 +383,7 @@ class AgentTask:
 		# Convert to proper JSON format (ensure None becomes null)
 		# Put the state data in the queue - ensure it's properly JSON serialized
 		await self.state_queue.put(json.loads(json.dumps(state_data, default=str)))
-	
+		
 		# If this requires input, auto-pause the agent
 		if requires_input:
 			logger.info(f"Task {self.task_id} paused waiting for human input")
@@ -444,14 +562,14 @@ class MultiAgentManager:
 			# Sleep for the check interval
 			await asyncio.sleep(check_interval)
 	
-	async def create_task(self, task_description: str, task_id: Optional[str] = None, model: str = 'gpt-4o-mini', headless: bool = True) -> str:
+	async def create_task(self, task_description: str, task_id: Optional[str] = None, model: str = 'gpt-4o-mini', model_provider: Optional[str] = None, api_key: Optional[str] = None, headless: bool = True) -> str:
 		"""Create a new agent task"""
 		# Generate a task ID if not provided
 		if not task_id:
 			task_id = str(uuid.uuid4())
 			
 		# Create and initialize the task with shared controller
-		task = AgentTask(task_id, task_description, model, headless)
+		task = AgentTask(task_id, task_description, model, model_provider, api_key, headless)
 		await task.initialize(controller=self.shared_controller)
 		
 		# Store the task
@@ -463,6 +581,8 @@ class MultiAgentManager:
 				"task_id": task_id,
 				"task_description": task_description,
 				"model": model,
+				"model_provider": model_provider,
+				"api_key": api_key,
 				"headless": headless,
 				"creation_time": task.creation_time,
 				"last_activity_time": task.last_activity_time,
@@ -624,7 +744,20 @@ app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 
 @app.post('/api/browser-use/tasks/')
 async def create_task(request: TaskRequest):
-	"""Create a new browser task without starting it"""
+	"""Create a new browser task without starting it
+	
+	Supported model providers:
+	- 'openai': OpenAI models like 'gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', etc.
+	  Requires OPENAI_API_KEY environment variable
+	
+	- 'anthropic': Claude models like 'claude-3-opus-20240229', 'claude-3-sonnet-20240229', etc.
+	  Requires ANTHROPIC_API_KEY environment variable
+	
+	- 'google': Google Gemini models like 'gemini-1.5-pro', 'gemini-1.5-flash', etc.
+	  Requires GOOGLE_API_KEY environment variable
+	
+	If model_provider is not specified, it will be auto-detected from the model name.
+	"""
 	global agent_manager
 	try:
 		# Create a new task with the provided task_id or generate one
@@ -648,6 +781,8 @@ async def create_task(request: TaskRequest):
 			task_description=request.task,
 			task_id=task_id,
 			model=request.model,
+			model_provider=request.model_provider,
+			api_key=request.api_key,
 			headless=request.headless
 		)
 		
@@ -682,15 +817,15 @@ async def run_and_stream(task_id: str, resume_request: ResumeTaskRequest = None)
 			raise HTTPException(status_code=404, detail=f"Task with ID {task_id} not found")
 		
 		# Check if task is already running
-		if task.is_running and not resume_request:
+		if task.is_running and not (resume_request and resume_request.input_text):
 			logger.info(f"Task {task_id} is already running")
 		# Otherwise start or resume the task
 		else:
-			if resume_request.input_text:
+			if resume_request and resume_request.input_text: 
 				# Resume with user input
 				await agent_manager.resume_task(task_id, resume_request)
 				logger.info(f"Resumed task {task_id} with user input")
-			else:
+			elif not task.is_running: 
 				# Start the task
 				await agent_manager.run_task(task_id)
 				logger.info(f"Started task {task_id}")

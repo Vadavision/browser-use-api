@@ -21,6 +21,11 @@ redis>=5.0.0
 aioredis>=2.0.0  # For async Redis operations
 
 # For browser automation
-browser-use==0.1.41
+browser-use @ git+https://github.com/browser-use/browser-use.git@main
 # For S3 integration
 boto3>=1.28.0
+
+# LLM integrations
+langchain-openai>=0.0.1
+langchain-anthropic>=0.1.1  # For Claude models
+langchain-google-genai>=0.0.3  # For Google Gemini models
