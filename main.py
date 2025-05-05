@@ -49,6 +49,8 @@ logger.info(f"CLOUD_BROWSER_URL set: {'Yes' if os.environ.get('CLOUD_BROWSER_URL
 logger.info(f"OPENAI_API_KEY set: {'Yes' if os.environ.get('OPENAI_API_KEY') else 'No'}")
 logger.info(f"ANTHROPIC_API_KEY set: {'Yes' if os.environ.get('ANTHROPIC_API_KEY') else 'No'}")
 logger.info(f"GOOGLE_API_KEY set: {'Yes' if os.environ.get('GOOGLE_API_KEY') else 'No'}")
+logger.info(f"USE_PROXY: {os.environ.get('USE_PROXY', 'Not set')}")
+logger.info(f"PROXY_SERVER: {os.environ.get('PROXY_SERVER', 'Not set')}")
 
 # Create a queue for log messages
 log_queue = Queue()
@@ -237,7 +239,8 @@ class AgentTask:
 				'headless': self.headless,
 				'extra_chromium_args': [
 					f'--remote-debugging-port={self.remote_debugging_port}',
-					'--remote-debugging-address=0.0.0.0'  # Allow external connections
+					'--remote-debugging-address=0.0.0.0',  # Allow external connections
+					'--disable-blink-features=AutomationControlled'  # Hide automation
 				]
 			}
 			

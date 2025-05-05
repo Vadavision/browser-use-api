@@ -21,7 +21,7 @@ redis>=5.0.0
 aioredis>=2.0.0  # For async Redis operations
 
 # For browser automation
-browser-use @ git+https://github.com/browser-use/browser-use.git@main
+browser-use==0.1.45
 # For S3 integration
 boto3>=1.28.0
 
